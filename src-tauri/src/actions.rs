@@ -4,7 +4,7 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
-use crate::managers::model::ModelManager;
+use crate::managers::model::{EngineType, ModelManager};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
@@ -507,7 +507,12 @@ impl ShortcutAction for TranscribeAction {
             .as_ref()
             .map(|m| m.supports_streaming)
             .unwrap_or(false);
-        let vad_policy = if !settings.vad_enabled {
+        // X-ASR needs continuous PCM, including pauses. Disabled VAD forwards
+        // exactly the same frames to the live worker and the saved/batch audio.
+        let requires_continuous_audio = selected_model_info
+            .as_ref()
+            .is_some_and(|m| matches!(m.engine_type, EngineType::XAsrStreaming));
+        let vad_policy = if !settings.vad_enabled || requires_continuous_audio {
             VadPolicy::Disabled
         } else if model_supports_streaming {
             VadPolicy::Streaming

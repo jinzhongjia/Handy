@@ -31,6 +31,14 @@
       "speed": "速度"
     },
     "models": {
+      "x-asr-zh-en-streaming-480ms": {
+        "name": "X-ASR 中英串流（480 毫秒）",
+        "description": "支援中文和英語，提供即時轉錄預覽。在本機 CPU 上執行，自動辨識兩種語言。"
+      },
+      "x-asr-zh-en-offline-int8": {
+        "name": "X-ASR 中英非串流（INT8）",
+        "description": "支援中文、英語和標點。真正的非串流 INT8 模型，在本機 CPU 上執行。長錄音以最長 30 秒分段轉錄。"
+      },
       "small": {
         "name": "Whisper Small",
         "description": "快速且相當準確"

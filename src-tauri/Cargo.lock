@@ -625,6 +625,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
+]
+
+[[package]]
 name = "cairo-rs"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2504,6 +2513,7 @@ name = "handy"
 version = "0.9.7"
 dependencies = [
  "anyhow",
+ "bzip2",
  "chrono",
  "clap",
  "cpal",
@@ -2516,6 +2526,7 @@ dependencies = [
  "gtk",
  "gtk-layer-shell",
  "handy-keys",
+ "handy-x-asr",
  "hf-hub",
  "hound",
  "isolang",
@@ -2527,6 +2538,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "once_cell",
+ "parking_lot",
  "rdev",
  "regex",
  "reqwest 0.12.28",
@@ -2590,6 +2602,21 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows 0.58.0",
+]
+
+[[package]]
+name = "handy-x-asr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cmake",
+ "flate2",
+ "hound",
+ "log",
+ "ort",
+ "serde_json",
+ "shlex",
+ "tar",
 ]
 
 [[package]]
@@ -3282,6 +3309,12 @@ dependencies = [
  "libloading",
  "once_cell",
 ]
+
+[[package]]
+name = "libbz2-rs-sys"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"

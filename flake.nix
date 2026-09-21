@@ -58,9 +58,36 @@
         gst-plugins-ugly
       ];
 
+      # Fetch native sources outside the build sandbox. The same immutable
+      # manifest drives the Cargo build on other platforms.
+      xasrNativeInputs = pkgs:
+        let
+          manifest = builtins.fromJSON (builtins.readFile ./src-tauri/x-asr/native/dependencies.json);
+          sourceArchive = pkgs.fetchurl {
+            inherit (manifest.sherpa) url sha256;
+          };
+        in {
+          source = pkgs.runCommand "handy-xasr-sherpa-source" {} ''
+            mkdir -p "$out"
+            tar -xzf ${sourceArchive} --strip-components=1 -C "$out"
+          '';
+          dependencies = pkgs.linkFarm "handy-xasr-native-dependencies"
+            (map (archive: {
+              inherit (archive) name;
+              path = pkgs.fetchurl { inherit (archive) url sha256; };
+            }) manifest.archives);
+        };
+
       # Shared environment variables for Rust/native builds
-      commonEnv = pkgs: let lib = pkgs.lib; in {
+      commonEnv = pkgs: let
+        lib = pkgs.lib;
+        native = xasrNativeInputs pkgs;
+      in {
         ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
+        ORT_INCLUDE_DIR = "${pkgs.onnxruntime.dev}/include";
+        ORT_LICENSE_DIR = "${pkgs.onnxruntime.src}";
+        HANDY_XASR_SOURCE_DIR = native.source;
+        HANDY_XASR_DEPENDENCY_DIR = native.dependencies;
         ORT_PREFER_DYNAMIC_LINK = "1";
         GST_PLUGIN_SYSTEM_PATH_1_0 = "${lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (gstPlugins pkgs)}";
       };
@@ -150,7 +177,7 @@
               cmake
               rustPlatform.bindgenHook
               shaderc
-            ];
+            ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.patchelf ];
 
             # Tests require runtime resources (audio devices, model files, GPU/Vulkan)
             # not available in the Nix build sandbox
@@ -229,10 +256,14 @@
               pkg-config
               rustPlatform.bindgenHook
               cmake
-            ]);
+            ]) ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.patchelf ];
 
             inherit (commonEnv pkgs)
               ORT_LIB_LOCATION
+              ORT_INCLUDE_DIR
+              ORT_LICENSE_DIR
+              HANDY_XASR_SOURCE_DIR
+              HANDY_XASR_DEPENDENCY_DIR
               ORT_PREFER_DYNAMIC_LINK
               GST_PLUGIN_SYSTEM_PATH_1_0;
 

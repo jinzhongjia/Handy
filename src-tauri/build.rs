@@ -25,11 +25,9 @@ fn main() {
     // static macOS `metal` build, where there is nothing to ship.
     stage_transcribe_runtime_libs();
 
-    // When ORT is dynamically linked (Windows CI sets ORT_LIB_LOCATION +
-    // ORT_PREFER_DYNAMIC_LINK to a baseline ONNX Runtime), ship its onnxruntime.dll
-    // next to Handy.exe so the app loads our baseline build instead of statically
-    // embedding pyke's /arch:AVX2 one (which crashes at startup on pre-Haswell CPUs).
-    stage_onnxruntime_dll();
+    // X-ASR owns the shared ONNX Runtime used by every ONNX consumer.
+    // Stage it after transcribe-cpp, which recreates this directory.
+    stage_xasr_runtime_libs();
 
     // Must run after transcribe staging because that helper recreates transcribe-libs/.
     stage_vc_runtime_dlls();
@@ -102,48 +100,63 @@ fn stage_vc_runtime_dlls() {
     );
 }
 
-/// Copy the dynamically-linked ONNX Runtime `onnxruntime.dll` into the
-/// `transcribe-libs/` staging dir so `tauri.windows.conf.json` bundles it beside
-/// `Handy.exe` (Windows resolves DLLs from the executable's directory).
-///
-/// No-op unless `ORT_PREFER_DYNAMIC_LINK` + `ORT_LIB_LOCATION` are set for a Windows
-/// target — i.e. the CI dynamic-link path. A plain static build (no env) skips this
-/// and keeps the embedded ORT, and non-Windows targets bundle their ORT elsewhere
-/// (see build.yml frameworks/deb.files steps), so they are ignored here.
-fn stage_onnxruntime_dll() {
+/// Stage the ASR-only native bridge and its shared ONNX Runtime.
+fn stage_xasr_runtime_libs() {
     use std::path::PathBuf;
 
-    println!("cargo:rerun-if-env-changed=ORT_LIB_LOCATION");
-    println!("cargo:rerun-if-env-changed=ORT_PREFER_DYNAMIC_LINK");
-
-    if std::env::var_os("ORT_PREFER_DYNAMIC_LINK").is_none() {
-        return;
-    }
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-    let Some(lib_location) = std::env::var_os("ORT_LIB_LOCATION") else {
-        return;
+    println!("cargo:rerun-if-env-changed=DEP_HANDY_XASR_RUNTIME_DIR");
+    let source = PathBuf::from(
+        std::env::var_os("DEP_HANDY_XASR_RUNTIME_DIR")
+            .expect("handy-x-asr must publish its runtime directory"),
+    );
+    println!("cargo:rerun-if-changed={}", source.display());
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("target OS");
+    let required = match target_os.as_str() {
+        "macos" => ["libhandy_xasr.dylib", "libonnxruntime.dylib"],
+        "windows" => ["handy_xasr.dll", "onnxruntime.dll"],
+        "linux" => ["libhandy_xasr.so", "libonnxruntime.so.1"],
+        other => panic!("X-ASR runtime packaging is not configured for {other}"),
     };
-
-    let src = PathBuf::from(&lib_location).join("onnxruntime.dll");
-    if !src.exists() {
-        panic!(
-            "ORT_PREFER_DYNAMIC_LINK is set but {} does not exist; a dynamic ORT \
-             build must supply onnxruntime.dll to bundle",
-            src.display()
-        );
+    let dest =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("transcribe-libs");
+    std::fs::create_dir_all(&dest).expect("create native runtime staging directory");
+    for name in required {
+        let library = source.join(name);
+        std::fs::copy(&library, dest.join(name))
+            .unwrap_or_else(|e| panic!("stage {}: {e}", library.display()));
     }
+    // Keep dependency notices with the shipped native code.
+    let notices = dest.join("licenses");
+    std::fs::create_dir_all(&notices).expect("create native license directory");
+    copy_native_notices(&source.join("licenses"), &notices);
+    if target_os == "windows" {
+        // The loader does not search the linker's library directory when running
+        // a development binary. Cargo's OUT_DIR is <profile>/build/<crate>/out.
+        let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let profile = out.ancestors().nth(3).expect("Cargo profile directory");
+        for name in required {
+            std::fs::copy(source.join(name), profile.join(name))
+                .unwrap_or_else(|e| panic!("stage development runtime {name}: {e}"));
+        }
+    } else {
+        // Absolute path serves cargo run/tests. Tauri adds the macOS Frameworks
+        // rpath; Linux's installed relative paths are configured in main().
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", source.display());
+    }
+}
 
-    // transcribe-libs/ is already created by stage_transcribe_runtime_libs() on the
-    // Windows x86_64 dynamic-backends build and bundled by tauri.windows.conf.json;
-    // create it defensively so this is self-contained.
-    let dest_dir =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("transcribe-libs");
-    std::fs::create_dir_all(&dest_dir).expect("create transcribe-libs staging dir");
-    std::fs::copy(&src, dest_dir.join("onnxruntime.dll"))
-        .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
-    println!("cargo:warning=Staged onnxruntime.dll for Windows bundling");
+fn copy_native_notices(source: &std::path::Path, dest: &std::path::Path) {
+    for entry in std::fs::read_dir(source).expect("read native runtime notices") {
+        let entry = entry.expect("read native runtime entry");
+        let kind = entry.file_type().expect("native notice entry type");
+        let target = dest.join(entry.file_name());
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target).expect("create native notice directory");
+            copy_native_notices(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target).expect("stage native license");
+        }
+    }
 }
 
 /// Stage transcribe-cpp's shared runtime libraries into `transcribe-libs/` so the

@@ -31,6 +31,14 @@
       "speed": "speed"
     },
     "models": {
+      "x-asr-zh-en-streaming-480ms": {
+        "name": "X-ASR Chinese–English Streaming (480 ms)",
+        "description": "Chinese and English with live transcription preview. Runs locally on CPU; recognizes both languages automatically."
+      },
+      "x-asr-zh-en-offline-int8": {
+        "name": "X-ASR Chinese–English Offline (INT8)",
+        "description": "Chinese and English with punctuation. A genuine non-streaming INT8 model running locally on CPU. Long recordings are transcribed in segments of up to 30 seconds."
+      },
       "small": {
         "name": "Whisper Small",
         "description": "Fast and fairly accurate."

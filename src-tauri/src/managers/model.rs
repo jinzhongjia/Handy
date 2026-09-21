@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tar::Archive;
 use tauri::{AppHandle, Emitter, Manager};
 
+mod bundle;
 mod download;
 
 use download::{HttpDownloadOutcome, DOWNLOAD_STALL_TIMEOUT};
@@ -36,6 +37,8 @@ pub enum EngineType {
     GigaAM,
     Canary,
     Cohere,
+    XAsrStreaming,
+    XAsrOffline,
 }
 
 /// Where a model comes from and how Handy obtains it — the routing discriminant
@@ -52,6 +55,8 @@ pub enum ModelSource {
     /// HF cache (so other tools reuse it). The file within the repo is
     /// [`ModelInfo::filename`].
     HuggingFace { repo_id: String, revision: String },
+    /// A matched, integrity-checked set of native model components.
+    Bundle,
     /// Already present on disk — a user-provided custom model, or one discovered
     /// in a shared cache. Nothing to download.
     Local,
@@ -77,7 +82,7 @@ pub struct ModelInfo {
     pub supported_languages: Vec<String>, // Languages this model can transcribe
     pub supports_language_selection: bool, // Whether the user can explicitly pick a language
     pub is_custom: bool,            // Whether this is a user-provided custom model
-    pub supports_streaming: bool, // Whether this model supports live streaming preview (transcribe-cpp)
+    pub supports_streaming: bool,   // Whether this model supports live streaming preview
     pub supports_language_detection: bool, // Whether the model can auto-detect language (gates the "Auto" option)
 }
 
@@ -522,6 +527,7 @@ pub struct ModelManager {
     models_dir: PathBuf,
     available_models: Mutex<HashMap<String, ModelInfo>>,
     cancel_flags: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    bundle_states: [bundle::BundleState; 2],
     extracting_models: Arc<Mutex<HashSet<String>>>,
     /// Single-flight guard for [`Self::rescan_local_models`] so concurrent
     /// refresh requests coalesce instead of scanning the disk in parallel.
@@ -1120,6 +1126,8 @@ impl ModelManager {
             },
         );
 
+        bundle::register_models(&mut available_models);
+
         // Seed the bundled offline catalog before the on-disk scans, so a model
         // already in the HF cache dedups onto its richer catalog entry (the scans
         // only insert ids not already present) instead of showing as a bare cache
@@ -1140,6 +1148,7 @@ impl ModelManager {
             models_dir,
             available_models: Mutex::new(available_models),
             cancel_flags: Arc::new(Mutex::new(HashMap::new())),
+            bundle_states: std::array::from_fn(|_| bundle::BundleState::default()),
             extracting_models: Arc::new(Mutex::new(HashSet::new())),
             is_rescanning: Arc::new(AtomicBool::new(false)),
         };
@@ -1377,14 +1386,36 @@ impl ModelManager {
     }
 
     fn update_download_status(&self) -> Result<()> {
-        // Snapshot in-flight download ids before taking the registry lock (the
-        // two locks are never nested) so a mid-download entry is never dropped.
-        let downloading_ids: HashSet<String> =
-            self.cancel_flags.lock().unwrap().keys().cloned().collect();
+        // A first-time drop-in must be hashed, but never while holding the registry lock.
+        let bundle_statuses = self.bundle_disk_statuses();
+        // Snapshot active ownership after any slow bundle hashing. The two
+        // registry/cancellation locks are never held together.
+        let (downloading_ids, active_ids): (HashSet<String>, HashSet<String>) = {
+            let flags = self.cancel_flags.lock().unwrap();
+            (
+                flags.keys().cloned().collect(),
+                flags
+                    .iter()
+                    .filter(|(_, token)| !token.is_cancelled())
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+            )
+        };
         let mut models = self.available_models.lock().unwrap();
         let mut vanished_models: Vec<String> = Vec::new();
 
         for model in models.values_mut() {
+            if matches!(model.source, ModelSource::Bundle) {
+                if let Some((index, (_, revision, status))) = bundle_statuses
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (id, _, _))| *id == model.id)
+                {
+                    let downloading = active_ids.contains(&model.id);
+                    self.bundle_states[index].apply_snapshot(model, *revision, status, downloading);
+                }
+                continue;
+            }
             if let ModelSource::HuggingFace { repo_id, revision } = &model.source {
                 // A models-dir copy counts too: mirror-fallback downloads land
                 // there, and it makes manual drop-ins of catalog files work.
@@ -2211,6 +2242,7 @@ impl ModelManager {
                     .download_hf_model(&model_info, repo_id.clone(), revision.clone())
                     .await;
             }
+            ModelSource::Bundle => return self.download_bundle_model(&model_info).await,
             ModelSource::Local => {
                 return Err(anyhow::anyhow!("No download source for model"));
             }
@@ -2406,6 +2438,10 @@ impl ModelManager {
 
         debug!("ModelManager: Found model info: {:?}", model_info);
 
+        if matches!(model_info.source, ModelSource::Bundle) {
+            return self.delete_bundle_model(&model_info);
+        }
+
         if let ModelSource::HuggingFace { repo_id, revision } = &model_info.source {
             let is_alternate_quant =
                 Self::is_catalog_alternate_quant(repo_id, &model_info.filename);
@@ -2534,6 +2570,7 @@ impl ModelManager {
     fn mark_model_unavailable(&self, model_id: &str) {
         let removed = {
             let mut models = self.available_models.lock().unwrap();
+            self.invalidate_bundle_status(model_id);
             let should_remove = models
                 .get(model_id)
                 .is_some_and(Self::disappears_when_missing);
@@ -2574,6 +2611,12 @@ impl ModelManager {
                 "Model is currently downloading: {}",
                 model_id
             ));
+        }
+
+        if matches!(model_info.source, ModelSource::Bundle) {
+            return self.verified_bundle_path(model_id).inspect_err(|_| {
+                self.mark_model_unavailable(model_id);
+            });
         }
 
         if let ModelSource::HuggingFace { repo_id, revision } = &model_info.source {
@@ -2638,6 +2681,7 @@ impl ModelManager {
 
     pub fn cancel_download(&self, model_id: &str) -> Result<()> {
         debug!("ModelManager: cancel_download called for: {}", model_id);
+        self.cancel_bundle_requests(model_id);
 
         // Trigger the cancellation token to stop the download. The HF path
         // aborts its in-flight chunk tasks and unwinds promptly; the URL path
@@ -2657,6 +2701,7 @@ impl ModelManager {
             let mut models = self.available_models.lock().unwrap();
             if let Some(model) = models.get_mut(model_id) {
                 model.is_downloading = false;
+                self.invalidate_bundle_status(model_id);
             }
         }
 

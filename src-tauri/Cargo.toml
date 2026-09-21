@@ -7,6 +7,11 @@ edition = "2021"
 license = "MIT"
 default-run = "handy"
 
+[workspace]
+members = ["x-asr"]
+default-members = ["."]
+resolver = "2"
+
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.
 
@@ -30,6 +35,7 @@ serde = { version = "1", features = ["derive"] }
 
 [dependencies]
 once_cell = "1"
+parking_lot = "0.12"
 tauri = { version = "2.11.5", features = [
   "protocol-asset",
   "macos-private-api",
@@ -74,12 +80,14 @@ chrono = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tar = "0.4.44"
 flate2 = "1.0"
+bzip2 = "0.6"
 sha2 = "0.10"
 # Whisper-family models run through transcribe-cpp (GGUF/ggml, native backends);
 # transcribe-rs is now ONNX-only (Parakeet, Moonshine, SenseVoice, GigaAM,
 # Canary, Cohere). Per-platform backend features are added in the target tables.
 transcribe-rs = { version = "0.3.8", features = ["onnx"] }
 transcribe-cpp = { version = "0.2.3", default-features = false }
+handy-x-asr = { path = "x-asr" }
 handy-keys = "0.3.4"
 ferrous-opencc = "0.2.3"
 clap = { version = "4", features = ["derive"] }
@@ -138,8 +146,8 @@ winreg = "0.55"
 # buys nothing on ARM — ALL_VARIANTS is an x86 concept, so a DL build there is
 # just a single portable CPU module shipped as a DLL. So ARM links transcribe-cpp
 # STATICALLY (no features = static CPU-only): the one CPU backend is compiled into
-# handy.exe and we ship zero DLLs, which sidesteps the installer's per-DLL
-# signtool verify entirely. CI pins -DGGML_NATIVE=OFF (see build.yml) so the
+# handy.exe without transcribe-cpp DLLs. X-ASR and the shared ONNX Runtime still
+# ship their own DLLs. CI pins -DGGML_NATIVE=OFF (see build.yml) so the
 # static build targets a portable ARM baseline, not the build runner's CPU.
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 transcribe-cpp = { version = "0.2.3", default-features = false, features = [

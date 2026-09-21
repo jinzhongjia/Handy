@@ -887,6 +887,10 @@ pub fn run(cli_args: CliArgs) {
         ))
         .manage(cli_args.clone())
         .setup(move |app| {
+            // All ONNX consumers (VAD, transcribe-rs and X-ASR) share the
+            // native backend's runtime. Initialize its API before any manager
+            // can create a session, including the headless CLI path.
+            handy_x_asr::init_runtime()?;
             #[cfg(target_os = "windows")]
             log::info!(
                 "Vulkan layer policy: VK_LOADER_LAYERS_DISABLE={:?}, HANDY_KEEP_VULKAN_IMPLICIT_LAYERS={}",

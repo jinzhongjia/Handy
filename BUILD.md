@@ -8,6 +8,7 @@ This guide covers how to set up the development environment and build Handy from
 
 - [Rust](https://rustup.rs/) (latest stable)
 - [Bun](https://bun.sh/) package manager
+- [CMake](https://cmake.org/download/) 3.21 or newer on `PATH`, and a C++17 compiler
 - [Tauri Prerequisites](https://tauri.app/start/prerequisites/)
 
 ### Platform-Specific Requirements
@@ -16,21 +17,9 @@ This guide covers how to set up the development environment and build Handy from
 
 - Xcode Command Line Tools
 - Install with: `xcode-select --install`
+- Install CMake with `brew install cmake`.
 
-##### Intel Mac (x86_64)
-
-Prebuilt ONNX Runtime binaries are not available for Intel Macs. Install ONNX Runtime via Homebrew and link dynamically:
-
-```bash
-brew install onnxruntime
-ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun run tauri dev
-```
-
-The same environment variables apply for production builds:
-
-```bash
-ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun run tauri build
-```
+The native ASR build downloads a pinned ONNX Runtime SDK for the target architecture, including Intel Macs. To use an existing shared SDK instead, see [X-ASR native runtime](#x-asr-native-runtime).
 
 #### Windows
 
@@ -79,12 +68,12 @@ ORT_LIB_LOCATION=$(brew --prefix onnxruntime)/lib ORT_PREFER_DYNAMIC_LINK=1 bun 
     spirv-headers-devel spirv-tools-devel glslang \
     gtk3-devel webkit2gtk4.1-devel libappindicator-gtk3-devel librsvg2-devel \
     gtk-layer-shell gtk-layer-shell-devel \
-    cmake
+    cmake patchelf
 
   # Arch Linux
   sudo pacman -S base-devel clang libevdev shaderc spirv-headers glslang alsa-lib pkgconf openssl vulkan-devel \
     gtk3 webkit2gtk-4.1 libappindicator-gtk3 librsvg gtk-layer-shell \
-    cmake
+    cmake patchelf
   ```
 
 ## Setup Instructions
@@ -115,6 +104,36 @@ bun run tauri build
 ```
 
 This compiles a release binary and generates platform-specific bundles (deb, rpm, AppImage on Linux; dmg on macOS; msi on Windows).
+
+### X-ASR native runtime
+
+`src-tauri/x-asr` builds an ASR-only sherpa-onnx 1.13.8 backend from pinned source. It does not require Python and does not build the TTS/espeak components. X-ASR runs on CPU. Its shared ONNX Runtime is also used by VAD and `transcribe-rs`, rather than linking a second runtime.
+
+The first build downloads native sources and an architecture-specific runtime SDK. Source hashes and offline-build dependencies are recorded in `src-tauri/x-asr/native/dependencies.json`. Nix prefetches these dependencies outside its build sandbox.
+
+Optional build overrides:
+
+| Variable                    | Purpose                                                                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `ORT_LIB_LOCATION`          | Directory containing a shared ONNX Runtime library supporting API 24 or newer. Windows also needs its import library.           |
+| `ORT_INCLUDE_DIR`           | Matching SDK headers; direct and nested system include layouts are supported.                                                   |
+| `ORT_LICENSE_DIR`           | Matching ONNX Runtime license/notices directory when they are not beside the supplied SDK.                                      |
+| `HANDY_XASR_SOURCE_DIR`     | Unpacked sherpa source matching the pinned revision.                                                                            |
+| `HANDY_XASR_DEPENDENCY_DIR` | Prefetched archives using the filenames in the dependency manifest; may also contain the target's ORT SDK archive.              |
+| `HANDY_XASR_NATIVE_DIR`     | An already-built matching Handy X-ASR runtime directory, including its `licenses` directory. Not a stock sherpa binary package. |
+
+The build stages the native bridge, ONNX Runtime and dependency notices in `src-tauri/transcribe-libs`. Tauri bundles the macOS libraries as frameworks; Windows keeps DLLs beside the executable; Linux uses the existing private library directory. Do not distribute only the raw executable.
+
+The two model downloads are independent: `x-asr-zh-en-streaming-480ms` and `x-asr-zh-en-offline-int8`. Offline recordings are segmented at pauses where possible, with a hard maximum of 30 seconds per segment; very short nonempty input is padded to 100 ms. Native exceptions are converted to errors before crossing into Rust.
+
+To exercise the native backend directly with an installed model and a mono 16 kHz WAV:
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -p handy-x-asr --example transcribe -- streaming MODEL_DIRECTORY AUDIO.wav
+cargo run --manifest-path src-tauri/Cargo.toml -p handy-x-asr --example transcribe -- offline MODEL_DIRECTORY AUDIO.wav
+```
+
+The streaming command prints live hypotheses and final text. The application itself can also be exercised with `handy --transcribe-file AUDIO.wav --model MODEL_ID --json`.
 
 ## Linux Install (from source)
 

@@ -9,6 +9,7 @@ use crate::settings::{
     TranscribeAcceleratorSetting,
 };
 use anyhow::Result;
+use handy_x_asr::{Mode as XAsrMode, XAsrModel};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -188,6 +189,8 @@ enum LoadedEngine {
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
     Cohere(CohereModel),
+    XAsrStreaming(XAsrModel),
+    XAsrOffline(XAsrModel),
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -260,8 +263,8 @@ pub struct TranscriptionManager {
     /// [`StreamRouter`]. Shared with the audio recorder so per-frame feeds skip
     /// Tauri state and the manager lock.
     router: Arc<StreamRouter>,
-    /// True only while a transcribe-cpp `Stream` is actually in flight (set by
-    /// the worker once `stream()` succeeds). Used for overlay/UI decisions.
+    /// True only while a native streaming session is actually in flight (set by
+    /// the worker once the stream begins). Used for overlay/UI decisions.
     stream_active: Arc<AtomicBool>,
     /// Streaming uses four independent flags: router open = frames should route,
     /// worker active = no second worker may start, engine lease = engine is out
@@ -416,11 +419,10 @@ impl TranscriptionManager {
 
         {
             let mut engine = self.lock_engine();
-            // Dropping the engine frees all resources
-            *engine = None;
-        }
-        {
             let mut current_model = self.current_model_id.lock().unwrap();
+            // Keep engine and identity changes atomic with stream lease returns.
+            // Dropping the engine frees all resources.
+            *engine = None;
             *current_model = None;
         }
 
@@ -546,10 +548,8 @@ impl TranscriptionManager {
         // fails, status should read "no loaded model", not the dropped engine.
         {
             let mut engine = self.lock_engine();
-            *engine = None;
-        }
-        {
             let mut current_model = self.current_model_id.lock().unwrap();
+            *engine = None;
             *current_model = None;
         }
 
@@ -705,15 +705,28 @@ impl TranscriptionManager {
                 })?;
                 LoadedEngine::Cohere(engine)
             }
+            EngineType::XAsrStreaming | EngineType::XAsrOffline => {
+                let mode = match model_info.engine_type {
+                    EngineType::XAsrStreaming => XAsrMode::Streaming,
+                    _ => XAsrMode::Offline,
+                };
+                let engine = XAsrModel::load(&model_path, mode).map_err(|e| {
+                    let error_msg = format!("Failed to load X-ASR model {}: {}", model_id, e);
+                    emit_loading_failed(&error_msg);
+                    anyhow::anyhow!(error_msg)
+                })?;
+                match model_info.engine_type {
+                    EngineType::XAsrStreaming => LoadedEngine::XAsrStreaming(engine),
+                    _ => LoadedEngine::XAsrOffline(engine),
+                }
+            }
         };
 
         // Update the current engine and model ID
         {
             let mut engine = self.lock_engine();
-            *engine = Some(loaded_engine);
-        }
-        {
             let mut current_model = self.current_model_id.lock().unwrap();
+            *engine = Some(loaded_engine);
             *current_model = Some(model_id.to_string());
         }
 
@@ -849,12 +862,9 @@ impl TranscriptionManager {
             }
         }
 
-        let model_id = self.get_current_model().unwrap_or_default();
-
         // Take the engine out of the mutex so we own it during streaming,
-        // structurally excluding any concurrent batch transcription (which
-        // transcribe-cpp's compute_lock would refuse anyway). Returned when the
-        // worker exits, or dropped if the model was switched/unloaded mid-stream.
+        // structurally excluding any concurrent batch transcription. Returned
+        // when the worker exits, or dropped if switched/unloaded mid-stream.
         if self
             .active_engine_lease
             .compare_exchange(0, worker_id, Ordering::AcqRel, Ordering::Acquire)
@@ -865,13 +875,22 @@ impl TranscriptionManager {
             drain_until_finalize(rx);
             return;
         }
-        let mut engine = match self.lock_engine().take() {
-            Some(e) => e,
+        let leased_engine = {
+            let mut engine = self.lock_engine();
+            let model_id = self
+                .current_model_id
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
+            engine.take().map(|engine| (engine, model_id))
+        };
+        let (mut engine, model_id) = match leased_engine {
+            Some(leased) => leased,
             None => {
                 info!(
-                    "Live preview: model '{}' was unloaded before streaming could begin; \
-                     falling back to batch transcription",
-                    model_id
+                    "Live preview: model was unloaded before streaming could begin; \
+                     falling back to batch transcription"
                 );
                 let _ = self.active_engine_lease.compare_exchange(
                     worker_id,
@@ -885,9 +904,13 @@ impl TranscriptionManager {
             }
         };
 
-        // Only transcribe-cpp models expose streaming; ONNX engines fall back to
-        // batch. The loaded session (not the ModelManager copy) is the source of
-        // truth for run-path capabilities.
+        if matches!(&engine, LoadedEngine::XAsrStreaming(_)) {
+            self.run_x_asr_stream_worker(engine, rx, &model_id);
+            return;
+        }
+
+        // transcribe-cpp runtime capabilities determine its streaming support;
+        // other engines (including offline X-ASR) use batch transcription.
         let (supports_streaming, supports_translate, languages) = match &engine {
             LoadedEngine::TranscribeCpp(session) => {
                 let model = session.model();
@@ -910,8 +933,8 @@ impl TranscriptionManager {
             }
             _ => {
                 info!(
-                    "Live preview: model '{}' is not a transcribe-cpp model; \
-                     streaming is unavailable, using batch transcription",
+                    "Live preview: model '{}' has no live streaming engine; \
+                     using batch transcription",
                     model_id
                 );
                 (false, false, Vec::new())
@@ -1090,13 +1113,98 @@ impl TranscriptionManager {
         // the engine has been returned to the pool.
     }
 
+    fn run_x_asr_stream_worker(
+        &self,
+        mut engine: LoadedEngine,
+        rx: mpsc::Receiver<StreamCmd>,
+        model_id: &str,
+    ) {
+        let mut finalize_reply = None;
+        let mut finalize_result = None;
+        let stream_usable = 'stream: {
+            let LoadedEngine::XAsrStreaming(model) = &mut engine else {
+                break 'stream false;
+            };
+            let mut stream = match model.start_stream() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    error!("Failed to begin X-ASR stream: {}", error);
+                    break 'stream false;
+                }
+            };
+
+            self.stream_active.store(true, Ordering::Release);
+            self.touch_activity();
+            info!(
+                "Live X-ASR streaming transcription started (model '{}', CPU)",
+                model_id
+            );
+
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    StreamCmd::Feed(pcm) => {
+                        self.touch_activity();
+                        match stream.feed(&pcm) {
+                            // X-ASR revises the complete hypothesis; none of it
+                            // is an append-only committed prefix before finish.
+                            Ok(Some(text)) => self.emit_stream_text("", &text),
+                            Ok(None) => {}
+                            Err(error) => {
+                                error!(
+                                    "X-ASR stream feed failed: {}; falling back to full batch transcription",
+                                    error
+                                );
+                                // Never finalize a run that lost a frame. Drop
+                                // its utterance state and return the engine
+                                // before allowing the full-audio fallback.
+                                break 'stream false;
+                            }
+                        }
+                    }
+                    StreamCmd::Finalize(reply) => {
+                        finalize_result = match stream.finish() {
+                            Ok(text) => Some(FinalizedStreamText {
+                                text,
+                                // Recognition is bilingual and automatic, but
+                                // the native result does not contain a LID.
+                                output_language: OutputLanguageEvidence::Unknown,
+                                supported_languages: vec!["zh".to_string(), "en".to_string()],
+                            }),
+                            Err(error) => {
+                                error!(
+                                    "X-ASR stream finish failed: {}; falling back to full batch transcription",
+                                    error
+                                );
+                                None
+                            }
+                        };
+                        finalize_reply = Some(reply);
+                        break;
+                    }
+                    // Dropping the borrowed stream cancels just this utterance.
+                    StreamCmd::Cancel => break,
+                }
+            }
+            true
+        };
+        // The stream's mutable borrow has ended; only now may batch reuse the
+        // model. The outer worker guard still owns the exclusive lease flags.
+        self.stream_active.store(false, Ordering::Release);
+        self.return_engine(engine, model_id);
+        if !stream_usable {
+            drain_until_finalize(rx);
+        } else if let Some(reply) = finalize_reply {
+            let _ = reply.send(finalize_result);
+        }
+    }
+
     /// Return the leased engine to the mutex, unless the model was switched or
     /// unloaded during transcription (in which case the stale engine is dropped).
     fn return_engine(&self, engine: LoadedEngine, expected_model_id: &str) {
-        let still_current =
-            self.current_model_id.lock().unwrap().as_deref() == Some(expected_model_id);
-        if still_current {
-            *self.lock_engine() = Some(engine);
+        let mut slot = self.lock_engine();
+        let current_model = self.current_model_id.lock().unwrap();
+        if current_model.as_deref() == Some(expected_model_id) && slot.is_none() {
+            *slot = Some(engine);
         } else {
             info!(
                 "Model changed/unloaded during transcription; dropping stale engine (was '{}')",
@@ -1234,12 +1342,6 @@ impl TranscriptionManager {
             );
         }
 
-        // Whether the loaded transcribe-cpp model advertises
-        // Feature::InitialPrompt. Informational (logged below); the whisper
-        // run extension and the fuzzy-correction skip are gated on
-        // `model_is_whisper` instead, since non-whisper archs can advertise
-        // the feature while rejecting the whisper-kind extension.
-        let mut model_takes_initial_prompt = false;
         // Whether the loaded model is actually whisper-family (arch string).
         // Non-whisper archs (e.g. Voxtral Small) can advertise
         // Feature::InitialPrompt yet reject the whisper-kind run extension
@@ -1285,7 +1387,7 @@ impl TranscriptionManager {
             if let LoadedEngine::TranscribeCpp(session) = &engine {
                 let model = session.model();
                 let caps = model.capabilities();
-                model_takes_initial_prompt = model.supports(Feature::InitialPrompt);
+                let model_takes_initial_prompt = model.supports(Feature::InitialPrompt);
                 model_is_whisper = model.arch() == "whisper";
                 model_supports_translate = caps.supports_translate;
                 model_languages = caps.languages;
@@ -1428,6 +1530,14 @@ impl TranscriptionManager {
                             .transcribe(&audio, &options)
                             .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
+                    }
+                    LoadedEngine::XAsrStreaming(model) | LoadedEngine::XAsrOffline(model) => {
+                        // No forced language, translation, or LID result. The
+                        // native offline mode handles bounded long-audio
+                        // segmentation; streaming mode also supports full batch.
+                        model
+                            .transcribe(&audio)
+                            .map_err(|e| anyhow::anyhow!("X-ASR transcription failed: {}", e))
                     }
                 }
             }));

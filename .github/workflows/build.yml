@@ -367,11 +367,8 @@ jobs:
           tar xzf ort.tgz
           ORT_DIR="$(pwd)/onnxruntime-osx-x86_64-${ORT_VERSION}"
           echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> $GITHUB_ENV
+          echo "ORT_INCLUDE_DIR=$ORT_DIR/include" >> $GITHUB_ENV
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> $GITHUB_ENV
-          # Bundle the versioned dylib (matches the install name @rpath/libonnxruntime.1.24.2.dylib)
-          jq --arg lib "$ORT_DIR/lib/libonnxruntime.${ORT_VERSION}.dylib" \
-            '.bundle.macOS.frameworks = [$lib]' \
-            src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
 
       - name: Install ONNX Runtime (x86_64 Linux, Ubuntu 22.04)
         if: contains(inputs.platform, 'ubuntu-22.04') && inputs.target == 'x86_64-unknown-linux-gnu'
@@ -382,21 +379,10 @@ jobs:
           tar xzf ort.tgz
           ORT_DIR="$(pwd)/onnxruntime-linux-x86_64-${ORT_VERSION}"
           echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> $GITHUB_ENV
+          echo "ORT_INCLUDE_DIR=$ORT_DIR/include" >> $GITHUB_ENV
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> $GITHUB_ENV
-          # Resolve symlinks so the deb bundler gets real files (not broken symlinks)
-          for f in "$ORT_DIR"/lib/libonnxruntime.so*; do
-            if [ -L "$f" ]; then
-              cp -L "$f" "$f.real" && mv "$f.real" "$f"
-            fi
-          done
-          # Ship ORT in Handy's private lib dir under its SONAME only — the one
-          # name the loader resolves (handy has NEEDED libonnxruntime.so.1).
-          # Shipping the .so/.so.x.y.z aliases too would triplicate the lib as
-          # real files and draw ldconfig warnings (issue #1639).
-          # deb.files key = destination in package, value = source on disk
-          jq --arg so1 "$ORT_DIR/lib/libonnxruntime.so.1" \
-            '.bundle.linux.deb.files["/usr/lib/Handy/libonnxruntime.so.1"] = $so1' \
-            src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+          # handy-x-asr and build.rs normalize/stage this same runtime for every
+          # package format; do not add a second, separately bundled ORT copy.
 
       # Windows x64 links a BASELINE ONNX Runtime dynamically instead of statically
       # embedding pyke's default download-binaries build, which is compiled with a
@@ -406,8 +392,7 @@ jobs:
       # MLAS runtime CPU dispatch, so it runs everywhere and dispatches to AVX2/AVX-512
       # kernels when present (perf parity on capable CPUs). build.rs stages
       # onnxruntime.dll into transcribe-libs/, which tauri.windows.conf.json bundles
-      # beside Handy.exe. ARM64 is excluded (all modern CPUs; keeps its static
-      # ORT posture).
+      # beside Handy.exe. ARM64 uses the ASR-only native build's shared runtime.
       # NOTE: sourced from Microsoft's GitHub release; can be re-hosted on
       # blob.handy.computer to match the macOS/Linux steps.
       - name: Install ONNX Runtime (Windows x64)
@@ -422,6 +407,8 @@ jobs:
           $ortLib = (Resolve-Path "ort-dist/onnxruntime-win-x64-$ORT_VERSION/lib").Path
           Write-Host "ORT_LIB_LOCATION=$ortLib"
           Add-Content -Path $env:GITHUB_ENV -Value "ORT_LIB_LOCATION=$ortLib"
+          $ortInclude = (Resolve-Path "ort-dist/onnxruntime-win-x64-$ORT_VERSION/include").Path
+          Add-Content -Path $env:GITHUB_ENV -Value "ORT_INCLUDE_DIR=$ortInclude"
           Add-Content -Path $env:GITHUB_ENV -Value "ORT_PREFER_DYNAMIC_LINK=1"
 
       # ggml-vulkan (built by transcribe-cpp-sys when the Vulkan backend is on)
@@ -479,7 +466,7 @@ jobs:
           LIBDIR="$(cd "$LIBDIR" && pwd)"
           echo "Located transcribe-cpp libs in: $LIBDIR"
           ls -la "$LIBDIR"
-          echo "LD_LIBRARY_PATH=$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$(pwd)/src-tauri/transcribe-libs:$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # linuxdeploy resolves `handy`'s NEEDED libs via `ldd` and HARD-FAILS
           # on an unresolved one (it does not warn-and-skip). libtranscribe.so
           # lives only in the cargo build tree, so also publish it (and the ggml
@@ -675,9 +662,8 @@ jobs:
               require_pattern "$listing" 'usr/bin/handy$' "handy binary"
               require_pattern "$listing" 'usr/lib/Handy/libtranscribe\.so(\.[0-9]+)+$' "transcribe runtime library (SONAME)"
               require_pattern "$listing" 'usr/lib/Handy/libggml-cpu.*\.so' "ggml CPU backend module"
-              if [[ "${{ inputs.platform }}" == *"ubuntu-22.04"* && "${{ inputs.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-                require_pattern "$listing" 'usr/lib/Handy/libonnxruntime\.so\.[0-9]+$' "ONNX Runtime library (SONAME)"
-              fi
+              require_pattern "$listing" 'usr/lib/Handy/libonnxruntime\.so\.1$' "shared ONNX Runtime"
+              require_pattern "$listing" 'usr/lib/Handy/libhandy_xasr\.so$' "X-ASR native bridge"
               # Handy's libs must stay out of the ldconfig-scanned /usr/lib
               # (issue #1639): app-private libs belong in /usr/lib/Handy only.
               # `[^/]+` excludes the Handy/ subdir, so only direct hits match.
@@ -811,10 +797,10 @@ jobs:
             throw "src-tauri/transcribe-libs contains no DLLs; every Windows build must stage the app-local VC++ runtime (issue #1527)"
           }
 
-          # x64 also ships dynamic transcribe/ggml/ORT DLLs; ARM64 is otherwise static.
-          $requiredStaged = @("msvcp140.dll", "vcruntime140.dll")
+          # Both architectures ship X-ASR and the shared ORT; x64 also ships ggml.
+          $requiredStaged = @("msvcp140.dll", "vcruntime140.dll", "handy_xasr.dll", "onnxruntime.dll")
           if ("${{ inputs.target }}" -notlike "aarch64*") {
-            $requiredStaged += @("vcomp140.dll", "onnxruntime.dll")
+            $requiredStaged += @("vcomp140.dll")
             if (-not ($stagedDlls | Where-Object { $_.Name -like "*transcribe*" })) {
               throw "Staging is missing transcribe runtime DLLs"
             }

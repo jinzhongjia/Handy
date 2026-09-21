@@ -1,7 +1,7 @@
 //! Shared direct-HTTP model download transport.
 //!
-//! Both legacy URL models and Hugging Face mirror fallbacks use this module;
-//! source-specific orchestration and finalization remain in the parent module.
+//! Legacy URL models, bundle components and Hugging Face mirror fallbacks use
+//! this module; source-specific orchestration and finalization remain separate.
 
 use super::{DownloadProgress, ModelManager};
 use anyhow::Result;
@@ -42,7 +42,7 @@ pub(super) enum HttpDownloadOutcome {
 /// Side-channel notifications from the resumable HTTP downloader, decoupled
 /// from Tauri (the production wrapper maps them onto app events) so the
 /// transport logic is testable without an `AppHandle`.
-enum HttpDownloadEvent<'a> {
+pub(super) enum HttpDownloadEvent<'a> {
     Progress(&'a DownloadProgress),
     VerificationStarted,
     VerificationCompleted,
@@ -85,7 +85,7 @@ impl ModelManager {
     }
 
     /// Computes the SHA256 hex digest of a file, reading in 64KB chunks to handle large models.
-    fn compute_sha256(path: &Path) -> Result<String> {
+    pub(super) fn compute_sha256(path: &Path) -> Result<String> {
         let mut file = File::open(path)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 65536];
@@ -181,7 +181,7 @@ impl ModelManager {
     ///   at the first excess byte, not trusted until it closes the stream
     /// - the final bytes are checked against `expected_size` (catalog, or
     ///   content-length when unknown) and `expected_sha256` before returning
-    async fn download_http_resumable_with_events(
+    pub(super) async fn download_http_resumable_with_events(
         model_id: &str,
         url: &str,
         partial_path: &Path,

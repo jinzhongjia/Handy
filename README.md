@@ -19,16 +19,20 @@ Handy was created to fill the gap for a truly open source, extensible speech-to-
 
 1. **Press** a configurable keyboard shortcut: hold it to record and release to stop, or tap it to toggle recording on and off (Hold-only and Toggle-only modes are also available)
 2. **Speak** your words while the shortcut is active
-3. **Release** and Handy processes your speech using Whisper
+3. **Release** and Handy finishes processing your speech using the selected model
 4. **Get** your transcribed text pasted directly into whatever app you're using
 
 The process is entirely local:
 
-- Silence is filtered using VAD (Voice Activity Detection) with Silero
+- VAD (Voice Activity Detection) can filter silence; streaming X-ASR keeps continuous audio, including pauses
 - Transcription uses your choice of models:
   - **Whisper models** (Small/Medium/Turbo/Large) with GPU acceleration when available
   - **Parakeet V3** - CPU-optimized model with excellent performance and automatic language detection
+  - **X-ASR Streaming (480 ms)** - local CPU recognition for Chinese and English, with live transcription preview
+  - **X-ASR Offline (INT8)** - a separate non-streaming Chinese–English model with punctuation; long recordings are processed in segments of up to 30 seconds
 - Works on Windows, macOS, and Linux
+
+The two [X-ASR](https://huggingface.co/GilgameshWind/X-ASR-zh-en) models are separate downloads in Models settings. Select the Live overlay to see streaming hypotheses. Both recognize Chinese and English automatically; neither supports forced source-language selection or translation to English.
 
 ## Quick Start
 
